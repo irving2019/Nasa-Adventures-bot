@@ -1,5 +1,6 @@
 import logging
 import random
+from datetime import date
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -10,18 +11,17 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import Command
 
 import keyboards
-
+from utils.db import get_user, save_user, get_leaderboard
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-
 class QuizState(StatesGroup):
     waiting_for_answer = State()
 
-# База вопросов для викторины
 QUIZ_QUESTIONS = {
     "easy": [
         {
@@ -76,29 +76,45 @@ QUIZ_QUESTIONS = {
     ]
 }
 
+def get_rank(score: int) -> str:
+    if score >= 150:
+        return "🌌 Межгалактический исследователь"
+    elif score >= 100:
+        return "🚀 Космический путешественник"
+    elif score >= 60:
+        return "👨‍🚀 Астронавт"
+    elif score >= 20:
+        return "🛰️ Кадет"
+    else:
+        return "🔭 Наблюдатель"
+
 @router.message(F.text == "❓ Викторина")
 async def start_quiz(message: Message):
     await message.answer(
         "Добро пожаловать в космическую викторину! 🚀\n"
-        "Выберите уровень сложности:",
+        "Выберите уровень сложности или просмотрите свои рекорды:",
         reply_markup=keyboards.quiz_keyboard
     )
 
 @router.callback_query(F.data.startswith("quiz_"))
-async def handle_quiz_difficulty(callback: CallbackQuery, state: FSMContext):
-    difficulty = callback.data.split("_")[1]
+async def handle_quiz_actions(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split("_")[1]
     
-    # Выбираем случайный вопрос из соответствующего уровня сложности
+    if action == "leaderboard":
+        await show_leaderboard_action(callback)
+        return
+    elif action == "profile":
+        await show_profile_action(callback)
+        return
+        
+    difficulty = action
     question = random.choice(QUIZ_QUESTIONS[difficulty])
     
-    # Сохраняем информацию о текущем вопросе
     await state.update_data(
         current_question=question,
-        difficulty=difficulty,
-        score=0
+        difficulty=difficulty
     )
     
-    # Создаем клавиатуру с вариантами ответов
     options_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=option, callback_data=f"answer_{i}")]
@@ -107,7 +123,7 @@ async def handle_quiz_difficulty(callback: CallbackQuery, state: FSMContext):
     )
     
     await callback.message.answer(
-        f"Вопрос:\n\n{question['question']}",
+        f"Вопрос ({difficulty}):\n\n{question['question']}",
         reply_markup=options_keyboard
     )
     
@@ -119,21 +135,108 @@ async def handle_answer(callback: CallbackQuery, state: FSMContext):
     user_answer = int(callback.data.split("_")[1])
     data = await state.get_data()
     question = data["current_question"]
+    difficulty = data["difficulty"]
     
-    if user_answer == question["correct"]:
-        score = data.get("score", 0) + 1
+    user_id = callback.from_user.id
+    username = callback.from_user.username or callback.from_user.first_name
+    
+    # Загружаем текущую статистику
+    user_stats = get_user(user_id)
+    if not user_stats:
+        user_stats = {'score': 0, 'correct_answers': 0, 'total_answers': 0, 'username': username}
+        
+    correct = (user_answer == question["correct"])
+    
+    points = 10 if correct else 0
+    new_score = user_stats['score'] + points
+    new_correct = user_stats['correct_answers'] + (1 if correct else 0)
+    new_total = user_stats['total_answers'] + 1
+    
+    save_user(user_id, username, new_score, new_correct, new_total, date.today().isoformat())
+    
+    rank = get_rank(new_score)
+    
+    if correct:
         await callback.message.answer(
-            "✅ Правильно!\n\n"
-            "Хотите продолжить викторину?",
+            f"✅ Правильно! Вы получили +10 очков.\n"
+            f"Ваш ранг: {rank} ({new_score} очков)\n\n"
+            f"Хотите продолжить?",
             reply_markup=keyboards.quiz_keyboard
         )
     else:
         correct_answer = question["options"][question["correct"]]
         await callback.message.answer(
-            f"❌ Неправильно. Правильный ответ: {correct_answer}\n\n"
-            "Хотите попробовать еще раз?",
+            f"❌ Неправильно. Правильный ответ: <tg-spoiler>{correct_answer}</tg-spoiler>\n"
+            f"Ваш ранг: {rank} ({new_score} очков)\n\n"
+            f"Хотите попробовать еще раз?",
             reply_markup=keyboards.quiz_keyboard
         )
     
     await state.clear()
     await callback.answer()
+
+async def show_leaderboard_action(callback: CallbackQuery):
+    leaders = get_leaderboard(10)
+    if not leaders:
+        await callback.message.answer("Таблица лидеров пока пуста. Будьте первым!")
+        await callback.answer()
+        return
+        
+    text = "🏆 <b>Таблица лидеров космической викторины</b> 🏆\n\n"
+    for i, (username, score, correct) in enumerate(leaders, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🛰️"
+        text += f"{medal} {i}. <b>{username}</b> — {score} очков ({correct} верных ответов)\n"
+        
+    await callback.message.answer(text, reply_markup=keyboards.quiz_keyboard)
+    await callback.answer()
+
+async def show_profile_action(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    username = callback.from_user.username or callback.from_user.first_name
+    stats = get_user(user_id)
+    
+    if not stats:
+        stats = {'score': 0, 'correct_answers': 0, 'total_answers': 0}
+        
+    accuracy = (stats['correct_answers'] / stats['total_answers'] * 100) if stats['total_answers'] > 0 else 0
+    rank = get_rank(stats['score'])
+    
+    text = (
+        f"🎖️ <b>Космический профиль: {username}</b>\n\n"
+        f"🔹 Ранг: {rank}\n"
+        f"🔹 Очки: {stats['score']}\n"
+        f"🔹 Верных ответов: {stats['correct_answers']} из {stats['total_answers']}\n"
+        f"🔹 Точность: {accuracy:.1f}%\n"
+    )
+    await callback.message.answer(text, reply_markup=keyboards.quiz_keyboard)
+    await callback.answer()
+
+@router.message(Command("leaderboard"))
+async def cmd_leaderboard(message: Message):
+    leaders = get_leaderboard(10)
+    if not leaders:
+        await message.answer("Таблица лидеров пока пуста. Будьте первым!")
+        return
+    text = "🏆 <b>Таблица лидеров космической викторины</b> 🏆\n\n"
+    for i, (username, score, correct) in enumerate(leaders, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🛰️"
+        text += f"{medal} {i}. <b>{username}</b> — {score} очков ({correct} верных ответов)\n"
+    await message.answer(text)
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message):
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
+    stats = get_user(user_id)
+    if not stats:
+        stats = {'score': 0, 'correct_answers': 0, 'total_answers': 0}
+    accuracy = (stats['correct_answers'] / stats['total_answers'] * 100) if stats['total_answers'] > 0 else 0
+    rank = get_rank(stats['score'])
+    text = (
+        f"🎖️ <b>Космический профиль: {username}</b>\n\n"
+        f"🔹 Ранг: {rank}\n"
+        f"🔹 Очки: {stats['score']}\n"
+        f"🔹 Верных ответов: {stats['correct_answers']} из {stats['total_answers']}\n"
+        f"🔹 Точность: {accuracy:.1f}%\n"
+    )
+    await message.answer(text)

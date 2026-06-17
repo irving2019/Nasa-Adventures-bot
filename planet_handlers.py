@@ -1,19 +1,28 @@
-"""
-Модуль обработчиков команд для работы с информацией о планетах.
-"""
-
 import aiohttp
 import logging
-import keyboards
+from typing import Optional
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
+
+import keyboards
 from data.planets import SOLAR_SYSTEM, EXOPLANETS
 from utils.cache import cache_response
 from utils.monitoring import track_performance
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+@cache_response(cache_type='planet_images')
+async def download_image_bytes(url: str) -> Optional[bytes]:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=15) as response:
+                if response.status == 200:
+                    return await response.read()
+    except Exception as e:
+        logger.error(f"Error downloading image {url}: {e}")
+    return None
 
 @router.message(F.text == "🌞 Солнечная система")
 async def show_planets(message: Message):
@@ -25,7 +34,6 @@ async def show_planets(message: Message):
 @router.message(F.text == "✨ Экзопланеты")
 @track_performance()
 async def show_exoplanets(message: Message):
-    """Показывает список доступных экзопланет."""
     try:
         await message.answer(
             "🌌 Выберите экзопланету для получения подробной информации:",
@@ -41,7 +49,7 @@ async def planet_info(callback: CallbackQuery):
         planet_id = callback.data.split("_")[1]
         if planet_id in SOLAR_SYSTEM:
             planet = SOLAR_SYSTEM[planet_id]
-            info = (f"{planet['name']}\n\n"
+            info = (f"🪐 {planet['name']}\n\n"
                    f"🔹 Тип: {planet['type']}\n"
                    f"🔹 Масса: {planet['mass']}\n"
                    f"🔹 {'Диаметр' if 'diameter' in planet else 'Орбитальный период'}: "
@@ -49,13 +57,13 @@ async def planet_info(callback: CallbackQuery):
                    f"🔹 Температура: {planet['temperature']}\n\n"
                    f"📝 {planet['description']}")
             
-            try:
+            image_data = await download_image_bytes(planet['image'])
+            if image_data:
                 await callback.message.answer_photo(
-                    photo=planet['image'],
+                    photo=BufferedInputFile(image_data, f"{planet_id}.jpg"),
                     caption=info
                 )
-            except Exception as e:
-                logger.error(f"Ошибка при отправке фото планеты {planet_id}: {str(e)}")
+            else:
                 await callback.message.answer(info)
         else:
             logger.error(f"Планета {planet_id} не найдена в базе данных")
@@ -63,20 +71,17 @@ async def planet_info(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"Ошибка при обработке информации о планете: {str(e)}")
         await callback.message.answer("Произошла ошибка при получении информации. Попробуйте позже.")
-    
     await callback.answer()
 
 @router.callback_query(F.data.startswith("exo_"))
 @track_performance()
-@cache_response(cache_type='exoplanet_info')
 async def show_exoplanet_info(callback: CallbackQuery):
-    """Показывает информацию о выбранной экзопланете."""
     try:
         await callback.answer()
         exo_id = callback.data.replace("exo_", "").lower()
         if exo_id in EXOPLANETS:
             planet = EXOPLANETS[exo_id]
-            description = (f"{planet['name']}\n\n"
+            description = (f"🌎 {planet['name']}\n\n"
                 f"🌍 Тип: {planet['type']}\n"
                 f"📏 Масса: {planet['mass']}\n"
                 f"🌟 Звезда: {planet['star']}\n"
@@ -86,32 +91,20 @@ async def show_exoplanet_info(callback: CallbackQuery):
                 f"🌐 Индекс схожести с Землей (ESI): {planet['esi']}\n\n"
                 f"📝 {planet['description']}")
 
-            try:
-                # Загружаем изображение напрямую через aiohttp
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(planet['image']) as response:
-                        if response.status == 200:
-                            image_data = await response.read()
-                            await callback.message.answer_photo(
-                                photo=BufferedInputFile(image_data, f"{exo_id}.jpg"),
-                                caption=description,
-                                reply_markup=keyboards.get_back_keyboard()
-                            )
-                        else:
-                            logger.error(f"Ошибка при загрузке изображения {planet['image']}: {response.status}")
-                            await callback.message.answer(
-                                text=f"{description}\n\n⚠️ Изображение временно недоступно",
-                                reply_markup=keyboards.get_back_keyboard()
-                            )
-            except Exception as img_error:
-                logger.error(f"Ошибка при загрузке изображения экзопланеты: {img_error}")
+            image_data = await download_image_bytes(planet['image'])
+            if image_data:
+                await callback.message.answer_photo(
+                    photo=BufferedInputFile(image_data, f"{exo_id}.jpg"),
+                    caption=description,
+                    reply_markup=keyboards.get_back_keyboard()
+                )
+            else:
                 await callback.message.answer(
                     text=f"{description}\n\n⚠️ Изображение временно недоступно",
                     reply_markup=keyboards.get_back_keyboard()
                 )
         else:
             await callback.message.answer("❌ Информация об этой экзопланете недоступна.")
-            
     except Exception as e:
         logger.error(f"Ошибка при отображении информации об экзопланете: {e}")
         await callback.message.answer("❌ Произошла ошибка. Попробуйте позже.")

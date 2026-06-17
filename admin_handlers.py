@@ -1,43 +1,30 @@
-"""
-Модуль для административных команд бота.
-
-Содержит команды для мониторинга производительности,
-управления кэшем и просмотра статистики.
-"""
-
 import logging
-
-from aiogram import Router, F
+from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from utils.cache import caches
+from config import ADMIN_IDS
+from utils.cache import clear_all_caches
 from utils.monitoring import monitor
 
 logger = logging.getLogger(__name__)
 router = Router()
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 @router.message(Command("stats"))
 async def show_stats(message: Message) -> None:
-    """
-    Показывает статистику производительности бота.
-    
-    Args:
-        message (Message): Входящее сообщение
-    """
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ разрешен только администраторам.")
+        return
+        
     try:
-        # Получаем статистику
         stats = monitor.get_summary()
-        
-        # Формируем сообщение
         text = "📊 Статистика бота\n\n"
-        
-        # Общая информация
         text += f"⏱ Время работы: {stats['uptime']}\n"
         text += f"📡 Всего API запросов: {stats['total_api_calls']}\n\n"
         
-        # Статистика API
         text += "🔄 Статистика API:\n"
         for endpoint, data in stats['api_stats'].items():
             text += f"- {endpoint}:\n"
@@ -54,27 +41,19 @@ async def show_stats(message: Message) -> None:
             text += f"  • Misses: {data['misses']}\n"
         
         await message.answer(text)
-        
     except Exception as e:
         logger.error(f"Error showing stats: {e}")
         await message.answer("Ошибка при получении статистики.")
 
-
 @router.message(Command("cache_clear"))
 async def clear_cache(message: Message) -> None:
-    """
-    Очищает все кэши бота.
-    
-    Args:
-        message (Message): Входящее сообщение
-    """
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ разрешен только администраторам.")
+        return
+        
     try:
-        # Очищаем все кэши
-        for cache_type, cache in caches.items():
-            cache.clear()
-        
+        await clear_all_caches()
         await message.answer("✅ Все кэши очищены.")
-        
     except Exception as e:
         logger.error(f"Error clearing cache: {e}")
         await message.answer("Ошибка при очистке кэша.")

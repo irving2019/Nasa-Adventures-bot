@@ -1,7 +1,3 @@
-"""
-HTTP-клиент для работы с API.
-"""
-
 import aiohttp
 import logging
 import asyncio
@@ -12,7 +8,6 @@ from aiohttp import ClientTimeout
 logger = logging.getLogger(__name__)
 
 class APIClient:
-    """Асинхронный клиент для API."""
     def __init__(self, base_url: str, headers: Optional[Dict[str, str]] = None):
         self.base_url = base_url
         self.headers = headers or {}
@@ -56,14 +51,14 @@ class APIClient:
                     async with session.get(full_url, **kwargs) as response:
                         if response.status == 429:
                             retry_after = int(response.headers.get('Retry-After', 60))
-                            logger.warning(f"429. Ждём {retry_after} сек")
+                            logger.warning(f"Rate limited (429). Waiting {retry_after} seconds.")
                             await asyncio.sleep(retry_after)
                             return await self.get(url, **kwargs)
                         response.raise_for_status()
                         return await response.json()
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt == max_retries - 1:
-                    logger.error(f"Ошибка запроса {url}: {e}", exc_info=True)
+                    logger.error(f"Request error {url}: {e}", exc_info=True)
                     raise
                 await asyncio.sleep(retry_delay * (attempt + 1))
                 await self.close()
@@ -76,16 +71,16 @@ class APIClient:
             async with self.session.get(url, params=params) as response:
                 if response.status == 429:
                     retry_after = int(response.headers.get('Retry-After', 60))
-                    logger.warning(f"429. Ждём {retry_after} сек")
+                    logger.warning(f"Rate limited (429). Waiting {retry_after} seconds.")
                     await asyncio.sleep(retry_after)
                     return await self.get_bytes(url, params)
                 response.raise_for_status()
                 return await response.read()
         except aiohttp.ClientError as e:
-            logger.error(f"Ошибка get_bytes {url}: {e}", exc_info=True)
+            logger.error(f"Error get_bytes {url}: {e}", exc_info=True)
             raise
         except Exception as e:
-            logger.error(f"Неожиданная ошибка get_bytes {url}: {e}", exc_info=True)
+            logger.error(f"Unexpected error get_bytes {url}: {e}", exc_info=True)
             raise
 
 nasa_client = APIClient("https://api.nasa.gov")

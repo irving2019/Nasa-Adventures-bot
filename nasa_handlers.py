@@ -1,22 +1,6 @@
-"""
-Модуль обработчиков команд для взаимодействия с API NASA.
-
-Этот модуль содержит обработчики для различных команд, связанных с получением
-данных от NASA API, включая:
-- Информацию о околоземных астероидах
-- Фотографии с марсоходов
-- Спутниковые снимки Земли
-
-Attributes:
-    router (Router): Роутер для обработки команд, связанных с NASA API
-    logger (Logger): Логгер для записи событий модуля
-"""
-
-import aiohttp
 import asyncio
 import logging
 import random
-
 from datetime import date, datetime, timedelta
 from io import BytesIO
 from PIL import Image
@@ -39,40 +23,67 @@ from utils.http import nasa_client
 from utils.monitoring import track_performance
 import keyboards
 
-
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Константы
-MAX_IMAGE_SIZE = (1280, 1280)  # Максимальный размер изображения
-CACHE_TIME = 3600  # Время кэширования в секундах
+MAX_IMAGE_SIZE = (1280, 1280)
 
-async def optimize_image(image_data: bytes, max_size: tuple = (1280, 1280)) -> bytes:
-    """Оптимизирует размер изображения для отправки в Telegram."""
+async def optimize_image(image_data: bytes, max_size: tuple = MAX_IMAGE_SIZE) -> bytes:
     try:
         with BytesIO(image_data) as img_file:
             img = Image.open(img_file)
-            
-            # Конвертируем в RGB если нужно
             if img.mode != 'RGB':
                 img = img.convert('RGB')
-            
-            # Уменьшаем размер если нужно
             if img.size[0] > max_size[0] or img.size[1] > max_size[1]:
                 img.thumbnail(max_size, Image.Resampling.LANCZOS)
-            
-            # Сохраняем оптимизированное изображение
             output = BytesIO()
             img.save(output, format='JPEG', quality=85, optimize=True)
             output.seek(0)
             return output.getvalue()
     except Exception as e:
-        logger.error(f"Ошибка при оптимизации изображения: {e}")
+        logger.error(f"Error optimizing image: {e}")
         return image_data
 
+@cache_response(cache_type='asteroids')
+async def fetch_asteroids(today_date: str) -> Optional[Dict[str, Any]]:
+    try:
+        params = {
+            "api_key": NASA_API_KEY,
+            "start_date": today_date,
+            "end_date": today_date
+        }
+        return await nasa_client.get("/neo/rest/v1/feed", params=params)
+    except Exception as e:
+        logger.error(f"Error fetching asteroids: {e}")
+        return None
+
+@cache_response(cache_type='mars_photos')
+async def fetch_rover_latest_photos(rover: str) -> Optional[Dict[str, Any]]:
+    try:
+        url = f"mars-photos/api/v1/rovers/{rover}/latest_photos"
+        return await nasa_client.get(url, params={"api_key": NASA_API_KEY})
+    except Exception as e:
+        logger.error(f"Error fetching rover photos: {e}")
+        return None
+
+@cache_response(cache_type='earth_imagery')
+async def fetch_earth_image(lat: float, lon: float, date_str: str) -> Optional[bytes]:
+    try:
+        params = {
+            "api_key": NASA_API_KEY,
+            "lat": lat,
+            "lon": lon,
+            "dim": 0.3,
+            "date": date_str
+        }
+        return await nasa_client.get_bytes("/planetary/earth/imagery", params=params)
+    except Exception as e:
+        logger.warning(f"Failed to get earth image for {date_str}: {e}")
+        return None
+
 @router.message(CommandStart())
+@router.message(F.text == "« Назад")
 async def cmd_start(message: Message) -> None:
-    """Обработчик команды /start."""
     await message.answer(
         "Привет! Я космический бот NASA. Я могу показать вам:\n"
         "☄️ Информацию о приближающихся астероидах\n"
@@ -87,131 +98,81 @@ async def cmd_start(message: Message) -> None:
 
 @router.message(F.text == "☄️ Астероиды")
 @track_performance()
-@cache_response(cache_type='asteroids')
 async def get_asteroids(message: Message) -> None:
-    """Обработчик команды получения информации об астероидах."""
-    logger.info("Обработчик астероидов вызван")
     try:
         today = date.today().isoformat()
-        params = {
-            "api_key": NASA_API_KEY,
-            "start_date": today,
-            "end_date": today
-        }
-        
-        data = await nasa_client.get("/neo/rest/v1/feed", params=params)
-        logger.debug(f"Получены данные об астероидах: {data}")
-        
+        data = await fetch_asteroids(today)
+        if not data:
+            await message.answer("Ошибка при получении данных от NASA. Попробуйте позже.")
+            return
+            
         asteroids = data.get('near_earth_objects', {}).get(today, [])
-        
         if not asteroids:
             await message.answer("На сегодня нет данных об астероидах. Попробуйте позже.")
             return
-        
-        # Сортируем по близости подлета к Земле
+            
         asteroids.sort(
             key=lambda x: float(x['close_approach_data'][0]['miss_distance']['kilometers'])
         )
         
-        logger.debug(f"Отсортированные астероиды: {asteroids[:5]}")
-        
-        # Отправляем информацию последовательно, чтобы избежать ошибок с порядком сообщений
         for ast in asteroids[:5]:
             try:
-                await send_asteroid_info(message, ast)
-                await asyncio.sleep(0.5)  # Небольшая задержка между сообщениями
+                avg_size = (
+                    ast['estimated_diameter']['meters']['estimated_diameter_min'] +
+                    ast['estimated_diameter']['meters']['estimated_diameter_max']
+                ) / 2
+                text = (
+                    f"☄️ <b>Астероид: {ast['name']}</b>\n\n"
+                    f"📏 Размер: {ast['estimated_diameter']['meters']['estimated_diameter_min']:.1f}"
+                    f"-{ast['estimated_diameter']['meters']['estimated_diameter_max']:.1f} м (средний: {avg_size:.1f} м)\n"
+                    f"⚠️ Опасен: {'Да ☢️' if ast['is_potentially_hazardous_asteroid'] else 'Нет ✅'}\n"
+                    f"🔺 Расстояние: {float(ast['close_approach_data'][0]['miss_distance']['kilometers']):,.0f} км\n"
+                    f"🚀 Скорость: {float(ast['close_approach_data'][0]['relative_velocity']['kilometers_per_hour']):,.0f} км/ч\n"
+                    f"⏰ Время сближения: {ast['close_approach_data'][0]['close_approach_date_full']}"
+                )
+                await message.answer(text, parse_mode="HTML")
+                await asyncio.sleep(0.3)
             except Exception as e:
-                logger.error(f"Ошибка при отправке информации об астероиде {ast.get('name', 'Unknown')}: {e}")
-        
+                logger.error(f"Error sending asteroid {ast.get('name')}: {e}")
     except Exception as e:
-        logger.error(f"Ошибка при получении данных об астероидах: {e}")
-        await message.answer(
-            "Извините, произошла ошибка при получении данных об астероидах. "
-            "Попробуйте позже."
-        )
-
-async def send_asteroid_info(message: Message, ast: Dict[str, Any]) -> None:
-    """Отправляет информацию об одном астероиде."""
-    try:
-        logger.info(f"Отправка информации об астероиде: {ast['name']}")
-        avg_size = (
-            ast['estimated_diameter']['meters']['estimated_diameter_min'] +
-            ast['estimated_diameter']['meters']['estimated_diameter_max']
-        ) / 2
-        
-        text = (
-            f"☄️ Астероид: {ast['name']}\n\n"
-            f"📏 Размер: {ast['estimated_diameter']['meters']['estimated_diameter_min']:.1f}"
-            f"-{ast['estimated_diameter']['meters']['estimated_diameter_max']:.1f} м\n"
-            f"⚠️ Опасен: {'Да ☢️' if ast['is_potentially_hazardous_asteroid'] else 'Нет ✅'}\n"
-            f"🔺 Макс. сближение: {float(ast['close_approach_data'][0]['miss_distance']['kilometers']):.0f} км\n"
-            f"🚀 Скорость: {float(ast['close_approach_data'][0]['relative_velocity']['kilometers_per_hour']):.0f} км/ч\n"
-            f"⏰ Время сближения: {ast['close_approach_data'][0]['close_approach_date_full']}"
-        )
-        
-        logger.info(f"Текст сообщения: {text}")
-        
-        # Отправляем только текстовое сообщение, без изображения
-        await message.answer(
-            text,
-            parse_mode="HTML"
-        )
-        logger.info("Сообщение успешно отправлено")
-
-    except Exception as e:
-        logger.error(f"Ошибка при отправке информации об астероиде: {e}")
-        await message.answer(
-            f"Информация об астероиде {ast['name']}:\n{text}"
-        )
+        logger.error(f"Error getting asteroids: {e}")
+        await message.answer("Произошла ошибка при получении данных об астероидах.")
 
 @router.message(F.text == "🔴 Марс")
 @track_performance()
-@cache_response(cache_type='mars_photos')
 async def get_mars_photos(message: Message) -> None:
-    """Обработчик команды получения фотографий с Марса."""
-    logger.info("Обработчик Марса вызван")
     try:
-        # Создаем клавиатуру для выбора марсохода
         buttons = []
         for rover_id, rover_info in ROVERS.items():
-            if rover_id in ['curiosity', 'perseverance']:  # Только активные марсоходы
+            if rover_id in ['curiosity', 'perseverance']:
                 buttons.append([InlineKeyboardButton(
                     text=f"🤖 {rover_info['name']}",
                     callback_data=f"get_rover_photo:{rover_id}"
                 )])
-        
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-        
         await message.answer(
-            "🔴 *Марсианские исследования*\n\n"
+            "🔴 <b>Марсианские исследования</b>\n\n"
             "Выберите марсоход для просмотра последних фотографий:",
             reply_markup=keyboard,
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
-
     except Exception as e:
-        logger.error(f"Ошибка при подготовке выбора марсохода: {e}")
-        await message.answer("Извините, произошла ошибка. Попробуйте позже.")
+        logger.error(f"Error sending rover keyboard: {e}")
+        await message.answer("Произошла ошибка. Попробуйте позже.")
 
 @router.callback_query(F.data.startswith("get_rover_photo"))
 async def get_rover_photo(callback: CallbackQuery) -> None:
-    """Обработчик получения случайной фотографии с марсохода."""
     try:
         await callback.answer()
         _, rover = callback.data.split(":")
         
-        # Пробуем получить последние фото
-        url = f"mars-photos/api/v1/rovers/{rover}/latest_photos"
-        data = await nasa_client.get(url, params={"api_key": NASA_API_KEY})
-        
-        if not data.get('latest_photos'):
+        data = await fetch_rover_latest_photos(rover)
+        if not data or not data.get('latest_photos'):
             await callback.message.answer(
-                f"К сожалению, для марсохода {ROVERS[rover]['name']} "
-                f"не удалось получить последние фотографии. Попробуйте позже."
+                f"Не удалось получить фотографии для марсохода {ROVERS[rover]['name']}. Попробуйте позже."
             )
             return
 
-        # Выбираем случайное фото из последних
         photo = random.choice(data['latest_photos'])
         image_data = await nasa_client.get_bytes(photo['img_src'])
         optimized_image = await optimize_image(image_data)
@@ -223,14 +184,9 @@ async def get_rover_photo(callback: CallbackQuery) -> None:
             f"📍 Сол: {photo.get('sol', 'N/A')}"
         )
 
-        # Добавляем кнопку для получения нового фото
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔄 Ещё фото",
-                    callback_data=f"get_rover_photo:{rover}"
-                )
-            ]
+            [InlineKeyboardButton(text="🔄 Ещё фото", callback_data=f"get_rover_photo:{rover}")],
+            [InlineKeyboardButton(text="« Главное меню", callback_data="main_menu")]
         ])
 
         await callback.message.answer_photo(
@@ -238,15 +194,9 @@ async def get_rover_photo(callback: CallbackQuery) -> None:
             caption=caption,
             reply_markup=keyboard
         )
-
     except Exception as e:
-        logger.error(f"Ошибка при получении фото с Марса: {e}")
-        await callback.message.answer(
-            "Извините, произошла ошибка при получении фотографий. "
-            "Попробуйте позже."
-        )
-
-
+        logger.error(f"Error handling rover photo: {e}")
+        await callback.message.answer("Произошла ошибка при получении фотографий.")
 
 @router.message(F.text == "ℹ️ Помощь")
 async def show_help(message: Message) -> None:
@@ -258,80 +208,52 @@ async def show_help(message: Message) -> None:
         "🌍 Земля - Спутниковые снимки Земли\n"
         "🔴 Марс - Фотографии с марсоходов\n"
         "✨ Экзопланеты - Каталог экзопланет\n"
-        "❓ Викторина - Космическая викторина\n\n"
-        "👨‍💼 Административные команды:\n"
-        "/stats - Статистика производительности\n"
-        "/cache_clear - Очистка кэша"
+        "❓ Викторина - Космическая викторина с рангами\n\n"
+        "📊 Викторина / Лидеры:\n"
+        "/leaderboard - Таблица лидеров\n"
+        "/profile - Мой профиль"
     )
 
 @router.message(F.text == "🌍 Земля")
 async def get_earth_image(message: Message) -> None:
-    """Обработчик команды получения спутниковых снимков Земли."""
     await message.answer(
-        "Для получения спутникового снимка, отправьте мне координаты в формате:\n"
-        "latitude,longitude\n\n"
-        "Например: 55.7558,37.6173 (Москва)",
-        reply_markup=keyboards.get_back_keyboard()
+        "Для получения спутникового снимка, отправьте геопозицию с помощью кнопки ниже "
+        "или введите координаты вручную в формате:\n"
+        "широта,долгота (например: 55.7558,37.6173)",
+        reply_markup=keyboards.get_earth_keyboard()
     )
 
-@router.message(F.text.regexp(r'^-?\d+\.?\d*,-?\d+\.?\d*$'))
-@cache_response(cache_type='earth_imagery')
-async def process_coordinates(message: Message) -> None:
-    """Обработчик получения координат для спутникового снимка."""
+async def process_coordinates_logic(message: Message, lat: float, lon: float) -> None:
     try:
-        # Показываем сообщение о загрузке
-        loading_message = await message.answer("🔄 Получаю спутниковый снимок...")
-        
-        lat, lon = map(float, message.text.split(','))
+        loading_message = await message.answer("🔄 Загружаю спутниковый снимок...")
         
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             await loading_message.edit_text(
-                "⚠️ Некорректные координаты! Широта должна быть от -90 до 90, "
-                "долгота от -180 до 180."
+                "⚠️ Некорректные координаты! Широта должна быть от -90 до 90, долгота от -180 до 180."
             )
             return
         
-        # Пробуем получить более новый снимок сначала
         today = date.today()
-        dates_to_try = [
-            today - timedelta(days=x) for x in [0, 30, 60, 90, 180]
-        ]
+        dates_to_try = [today - timedelta(days=x) for x in [0, 30, 60, 90, 180]]
         
         image_data = None
         used_date = None
         
         for try_date in dates_to_try:
-            try:
-                params = {
-                    "api_key": NASA_API_KEY,
-                    "lat": lat,
-                    "lon": lon,
-                    "dim": 0.3,
-                    "date": try_date.isoformat()
-                }
-                
-                image_data = await nasa_client.get_bytes("/planetary/earth/imagery", params=params)
-                if image_data:
-                    used_date = try_date
-                    break
-            except Exception as e:
-                logger.warning(f"Не удалось получить снимок за {try_date}: {e}")
-                continue
+            image_data = await fetch_earth_image(lat, lon, try_date.isoformat())
+            if image_data:
+                used_date = try_date
+                break
         
         if not image_data:
             await loading_message.edit_text(
-                "❌ К сожалению, не удалось найти спутниковые снимки для этих координат. "
-                "Попробуйте другие координаты или повторите запрос позже."
+                "❌ Не удалось найти спутниковые снимки для этих координат. Попробуйте другие."
             )
             return
             
-        # Оптимизируем изображение
         optimized_image = await optimize_image(image_data)
-        
-        # Удаляем сообщение о загрузке
         await loading_message.delete()
         
-        # Формируем подпись
         caption = (
             f"🌍 Спутниковый снимок локации:\n"
             f"📍 Широта: {lat:.4f}°\n"
@@ -339,28 +261,36 @@ async def process_coordinates(message: Message) -> None:
             f"📅 Дата снимка: {used_date.strftime('%d.%m.%Y')}"
         )
         
-        # Отправляем фото
         await message.answer_photo(
             photo=BufferedInputFile(optimized_image, "earth.jpg"),
             caption=caption,
-            reply_markup=keyboards.get_back_keyboard()
+            reply_markup=keyboards.main_keyboard
         )
-            
+    except Exception as e:
+        logger.error(f"Error getting Earth image: {e}")
+        await message.answer("❌ Произошла ошибка при получении снимка.")
+
+@router.message(F.location)
+@track_performance()
+async def process_location(message: Message) -> None:
+    lat = message.location.latitude
+    lon = message.location.longitude
+    await process_coordinates_logic(message, lat, lon)
+
+@router.message(F.text.regexp(r'^-?\d+\.?\d*,-?\d+\.?\d*$'))
+@track_performance()
+async def process_text_coordinates(message: Message) -> None:
+    try:
+        lat, lon = map(float, message.text.split(','))
+        await process_coordinates_logic(message, lat, lon)
     except ValueError:
         await message.answer(
             "⚠️ Неверный формат координат. Пожалуйста, используйте формат: широта,долгота\n"
-            "Например: 55.7558, 37.6173 (Москва)"
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при получении снимка Земли: {e}")
-        await message.answer(
-            "❌ Извините, произошла ошибка при получении снимка. "
-            "Попробуйте позже."
+            "Например: 55.7558,37.6173"
         )
 
 @router.callback_query(F.data == "main_menu")
 async def return_to_main_menu(callback: CallbackQuery) -> None:
-    """Обработчик команды возврата в главное меню."""
     await callback.message.answer(
         "Выберите интересующий вас раздел:",
         reply_markup=keyboards.main_keyboard
